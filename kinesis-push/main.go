@@ -8,11 +8,10 @@ import (
 	"fmt"
 	"github.com/awslabs/aws-sdk-go/aws"
 	"github.com/awslabs/aws-sdk-go/service/kinesis"
-	"github.com/awslabs/aws-sdk-go/service/sts"
+	"github.com/mateusz/aws-temp-creds"
 	"io"
 	"log"
 	"net"
-	"os"
 	"time"
 )
 
@@ -43,8 +42,7 @@ var (
 
 // AWS-related structures.
 var (
-	tempCredentials *TempCredentialsProvider
-	kinesisClient   *kinesis.Kinesis
+	kinesisClient *kinesis.Kinesis
 )
 
 func init() {
@@ -80,7 +78,7 @@ func init() {
 	}
 
 	// Create AWS structures.
-	tempCredentials = &TempCredentialsProvider{
+	tempCredentials := &awstempcreds.TempCredentialsProvider{
 		Region:   awsRegion,
 		Duration: time.Duration(credDuration) * time.Second,
 		RoleARN:  awsArn,
@@ -99,70 +97,20 @@ func main() {
 	sender(pipeline)
 }
 
-type TempCredentialsProvider struct {
-	Region      string
-	Duration    time.Duration
-	RoleARN     string
-	role        *sts.AssumeRoleOutput
-	nextRefresh time.Time
-}
-
-// Refresh the temporary credentials - get a new role.
-func (p *TempCredentialsProvider) Refresh() error {
-	stsClient := sts.New(&aws.Config{
-		Region: p.Region,
-	})
-
-	hostname, err := os.Hostname()
-	if err != nil {
-		hostname = "unknown"
-	}
-
-	p.role, err = stsClient.AssumeRole(&sts.AssumeRoleInput{
-		DurationSeconds: aws.Long(int64(p.Duration / time.Second)),
-		RoleARN:         aws.String(p.RoleARN),
-		RoleSessionName: aws.String(fmt.Sprintf("temp-%s-%d", hostname, time.Now().Unix())),
-	})
-
-	return err
-}
-
-// Transforms the temporary sts.Credentials stored in the role into proper aws.Credentials.
-func (p *TempCredentialsProvider) Credentials() (*aws.Credentials, error) {
-	if time.Now().After(p.nextRefresh) {
-		err := tempCredentials.Refresh()
-		if err != nil {
-			// Retry sooner than p.Duration.
-			return nil, err
-		}
-
-		// Schedule next refresh 5 minutes before the credentials are due to expire.
-		p.nextRefresh = time.Now().Add(p.Duration - (5 * time.Minute))
-	}
-
-	// Transpose the temporary sts.Credentials into aws.Credentials.
-	return &aws.Credentials{
-		AccessKeyID:     *p.role.Credentials.AccessKeyID,
-		SecretAccessKey: *p.role.Credentials.SecretAccessKey,
-		SessionToken:    *p.role.Credentials.SessionToken,
-	}, nil
-}
-
 // Sends the record to Kinesis. This could take any amount of time due to the internal retries.
 func sendAndReset(record *bytes.Buffer) {
 	// Partition by hashing the data. This will be a bit random, but will at least ensure all shards are used
 	// (if we ever have more than one)
 	partitionKey := fmt.Sprintf("%x", md5.Sum(record.Bytes()))
-	output, err := kinesisClient.PutRecord(&kinesis.PutRecordInput{
+	_, err := kinesisClient.PutRecord(&kinesis.PutRecordInput{
 		Data:         record.Bytes(),
 		PartitionKey: aws.String(partitionKey),
 		StreamName:   aws.String(awsStreamName),
 	})
 
 	if err != nil {
-		log.Printf("PUT error: %s\n", err)
-	} else {
-		log.Printf("Sent %d bytes with Seqno %s and ShardID %s\n", record.Len(), *output.SequenceNumber, *output.ShardID)
+		// Send has failed - drop the record and proceed.
+		log.Printf("Sender failed to put record: %s\n", err)
 	}
 
 	record.Reset()
@@ -186,7 +134,11 @@ func sender(pipeline chan []byte) {
 				sendAndReset(record)
 				tickStart = time.Now()
 			}
-			record.Write(line)
+
+			_, err := record.Write(line)
+			if err != nil {
+				log.Fatal("Sender failed to write into the record buffer: %s\n", err)
+			}
 		default:
 			// Poll for some more data to come.
 			time.Sleep(1 * time.Second)
@@ -207,14 +159,14 @@ func sender(pipeline chan []byte) {
 func listener(pipeline chan []byte) {
 	listener, err := net.Listen(connType, fmt.Sprintf("%s:%d", connHost, connPort))
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 	defer listener.Close()
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			log.Println(err)
+			log.Printf("Listener failed to accept connection: %s\n", err)
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
@@ -227,7 +179,7 @@ func listener(pipeline chan []byte) {
 			// Returns err != nil if and only if the returned data does not end in delim.
 			if err != nil {
 				if err != io.EOF {
-					log.Println(err)
+					log.Printf("Listener failed reading from connection: %s\n", err)
 				}
 				break
 			}
