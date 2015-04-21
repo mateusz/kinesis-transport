@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/md5"
 	"flag"
 	"fmt"
 	"github.com/awslabs/aws-sdk-go/aws"
@@ -11,6 +12,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
 	"time"
 )
 
@@ -30,6 +32,7 @@ var (
 	awsArn        = ""
 	awsRegion     = ""
 	awsStreamName = ""
+	credDuration  = 3600
 )
 
 // Computed inputs.
@@ -40,7 +43,7 @@ var (
 
 // AWS-related structures.
 var (
-	tempCredentials *tempCredentialsProvider
+	tempCredentials *TempCredentialsProvider
 	kinesisClient   *kinesis.Kinesis
 )
 
@@ -57,15 +60,13 @@ func init() {
 	flag.StringVar(&connHost, "host", connHost, "Hostname")
 	flag.IntVar(&connPort, "port", connPort, "Port")
 	flag.StringVar(&connType, "protocol", connType, "Protocol (tcp or udp)")
+	flag.IntVar(&credDuration, "cred-duration", credDuration, "Temporary credentials duration. Min 900, max 3600 seconds.")
 
 	flag.Parse()
 
 	// Transform units from int (milliseconds) to duration.
 	minTickDuration = time.Duration(minTick) * time.Millisecond
 	maxTickDuration = time.Duration(maxTick) * time.Millisecond
-
-	log.Printf("Peak possible memory usage for metrics in transit: %d MB\n", ((lineCap*pipelineCap)+recordCap)/1024/1024)
-	log.Printf("Maximum Kinesis write throughput: %d kB/s\n", recordCap/minTick*1000/1024)
 
 	// Validate required inputs.
 	if awsArn == "" {
@@ -79,10 +80,10 @@ func init() {
 	}
 
 	// Create AWS structures.
-	tempCredentials = &tempCredentialsProvider{}
-	err := tempCredentials.Refresh()
-	if err != nil {
-		log.Fatal(err)
+	tempCredentials = &TempCredentialsProvider{
+		Region:   awsRegion,
+		Duration: time.Duration(credDuration) * time.Second,
+		RoleARN:  awsArn,
 	}
 
 	kinesisClient = kinesis.New(&aws.Config{
@@ -90,7 +91,6 @@ func init() {
 		Credentials: tempCredentials,
 		MaxRetries:  maxRetries,
 	})
-	kinesisClient.ShouldRetry = shouldRetry
 }
 
 func main() {
@@ -99,74 +99,68 @@ func main() {
 	sender(pipeline)
 }
 
-type tempCredentialsProvider struct {
-	Role *sts.AssumeRoleOutput
+type TempCredentialsProvider struct {
+	Region      string
+	Duration    time.Duration
+	RoleARN     string
+	role        *sts.AssumeRoleOutput
+	nextRefresh time.Time
 }
 
 // Refresh the temporary credentials - get a new role.
-func (p *tempCredentialsProvider) Refresh() error {
+func (p *TempCredentialsProvider) Refresh() error {
 	stsClient := sts.New(&aws.Config{
-		Region:     awsRegion,
-		MaxRetries: maxRetries,
+		Region: p.Region,
 	})
 
-	var err error
-	p.Role, err = stsClient.AssumeRole(&sts.AssumeRoleInput{
-		RoleARN:         aws.String(awsArn),
-		RoleSessionName: aws.String("kinesis"),
+	hostname, err := os.Hostname()
+	if err != nil {
+		hostname = "unknown"
+	}
+
+	p.role, err = stsClient.AssumeRole(&sts.AssumeRoleInput{
+		DurationSeconds: aws.Long(int64(p.Duration / time.Second)),
+		RoleARN:         aws.String(p.RoleARN),
+		RoleSessionName: aws.String(fmt.Sprintf("temp-%s-%d", hostname, time.Now().Unix())),
 	})
 
 	return err
 }
 
 // Transforms the temporary sts.Credentials stored in the role into proper aws.Credentials.
-func (p *tempCredentialsProvider) Credentials() (*aws.Credentials, error) {
-	if p.Role == nil {
-		err := p.Refresh()
+func (p *TempCredentialsProvider) Credentials() (*aws.Credentials, error) {
+	if time.Now().After(p.nextRefresh) {
+		err := tempCredentials.Refresh()
 		if err != nil {
+			// Retry sooner than p.Duration.
 			return nil, err
 		}
+
+		// Schedule next refresh 5 minutes before the credentials are due to expire.
+		p.nextRefresh = time.Now().Add(p.Duration - (5 * time.Minute))
 	}
 
+	// Transpose the temporary sts.Credentials into aws.Credentials.
 	return &aws.Credentials{
-		AccessKeyID:     *p.Role.Credentials.AccessKeyID,
-		SecretAccessKey: *p.Role.Credentials.SecretAccessKey,
-		SessionToken:    *p.Role.Credentials.SessionToken,
+		AccessKeyID:     *p.role.Credentials.AccessKeyID,
+		SecretAccessKey: *p.role.Credentials.SecretAccessKey,
+		SessionToken:    *p.role.Credentials.SessionToken,
 	}, nil
-}
-
-// Check if the request should be retried with exponential backoff.
-// Copied mostly from github.com/awslabs/aws-sdk-go/aws/service.go
-func shouldRetry(r *aws.Request) bool {
-	if r.HTTPResponse.StatusCode >= 500 {
-		return true
-	} else if err := aws.Error(r.Error); err != nil {
-		switch err.Code {
-		case "ExpiredTokenException":
-			// Fine to retry, but only after refreshing credentials.
-			log.Println("Token has expired. Refreshing and retrying...")
-			err := tempCredentials.Refresh()
-			if err != nil {
-				return false
-			}
-			return true
-		case "ProvisionedThroughputExceededException", "Throttling":
-			log.Println("Hit throttling exception. Backing off...")
-			return true
-		}
-	}
-	return false
 }
 
 // Sends the record to Kinesis. This could take any amount of time due to the internal retries.
 func sendAndReset(record *bytes.Buffer) {
+	// Partition by hashing the data. This will be a bit random, but will at least ensure all shards are used
+	// (if we ever have more than one)
+	partitionKey := fmt.Sprintf("%x", md5.Sum(record.Bytes()))
 	output, err := kinesisClient.PutRecord(&kinesis.PutRecordInput{
 		Data:         record.Bytes(),
-		PartitionKey: aws.String("1"),
+		PartitionKey: aws.String(partitionKey),
 		StreamName:   aws.String(awsStreamName),
 	})
+
 	if err != nil {
-		log.Println(err)
+		log.Printf("PUT error: %s\n", err)
 	} else {
 		log.Printf("Sent %d bytes with Seqno %s and ShardID %s\n", record.Len(), *output.SequenceNumber, *output.ShardID)
 	}
