@@ -5,100 +5,122 @@ import (
 	"bytes"
 	"io"
 	"log"
-	"os"
-	"os/signal"
-	"syscall"
+	"net"
 	"time"
 )
 
-const recordCap = 50 * 1024
+// Memory used for metrics is pipeline size + send record size: at most (lineCap * pipelineCap) + recordCap [Bytes]
+// Top throughput is no more than one record per minTick: at most recordCap / minTick [Bytes/second]
+const (
+	// Amount of metric lines we can hold in the buffer at any given time. Overflow will immediately be dropped.
+	pipelineCap = 1000
+	// Maximum length of a single metric line.
+	lineCap = 10 * 1024
+	// Maximum size of the record to send.
+	recordCap = 50 * 1024
+	// Maximum amount of time to wait for data before sending a single record.
+	// This is how much data we can stand to loose if the daemon crashes.
+	maxTick = 1 * time.Second
+	// Minimum amount of time between subsequent sends.
+	// Must be < maxTick
+	minTick = 1 * time.Second
+	// TCP connection details
+	connHost = "localhost"
+	connPort = "2003"
+	connType = "tcp"
+)
 
 func main() {
-	pipeName := "kinesis-push"
-
-	// Create a named pipe for input.
-	if _, err := os.Stat(pipeName); os.IsExist(err) {
-		log.Fatal(err)
-	}
-
-	if err := syscall.Mknod(pipeName, syscall.S_IFIFO|0660, 0); err != nil {
-		log.Fatal(err)
-	}
-	defer os.Remove(pipeName)
-
-	// Catch signals and quit gracefully.
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan,
-		syscall.SIGHUP,
-		syscall.SIGINT,
-		syscall.SIGTERM,
-		syscall.SIGQUIT)
-	go func() {
-		_ = <-sigChan
-		// This allows us to clean up.
-		os.Remove(pipeName)
-		os.Exit(1)
-	}()
-
-	readDaemon(pipeName)
+	pipeline := make(chan []byte, pipelineCap)
+	go listener(pipeline)
+	sender(pipeline)
 }
 
-func readDaemon(pipeName string) {
-	// This will block until the first byte is available.
-	pipe, err := os.Open(pipeName)
+// Sends the record to Kinesis.
+func sendAndReset(record *bytes.Buffer) {
+	log.Printf("Sending %d\n", record.Len())
+	record.Reset()
+}
+
+// Continuously drains the pipeline, waits for data for maxTick, sends not more frequently than minTick.
+func sender(pipeline chan []byte) {
+	record := new(bytes.Buffer)
+	tickStart := time.Now()
+	for {
+		select {
+		case line := <-pipeline:
+			// Check if we are overflowing the 50kB maximum Kinesis message size.
+			if len(line)+record.Len() > recordCap {
+				// Respect the minTick - we don't want to send more often than once per minTick.
+				sinceStart := time.Since(tickStart)
+				if sinceStart < minTick {
+					time.Sleep(minTick - sinceStart)
+				}
+
+				sendAndReset(record)
+				tickStart = time.Now()
+			}
+			record.Write(line)
+		default:
+			// Poll for some more data to come.
+			time.Sleep(1 * time.Second)
+		}
+
+		// Wait for data for maxTick, then send what we have.
+		if time.Since(tickStart) > maxTick {
+			if record.Len() > 0 {
+				sendAndReset(record)
+			}
+			tickStart = time.Now()
+		}
+	}
+}
+
+// Listens to TCP port and puts all the data into the pipeline channel.
+// Lines are truncated to lineCap, if the channel has no more space remaining lines are dropped.
+func listener(pipeline chan []byte) {
+	listener, err := net.Listen(connType, connHost+":"+connPort)
 	if err != nil {
 		panic(err)
 	}
-	defer pipe.Close()
-
-	pipeReader := bufio.NewReader(pipe)
-	// Buffer to hold a single record. Kinesis can handle up to 50kB of data in one go.
-	record := new(bytes.Buffer)
-	// Buffer for a single line of metrics.
-	var line []byte
+	defer listener.Close()
 
 	for {
-		// Keep reading until we have drained the buffer, or reached 50kB record limit.
+		conn, err := listener.Accept()
+		if err != nil {
+			log.Println(err)
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+
+		// Send lines down the channel.
+		reader := bufio.NewReader(conn)
 		for {
-			var err error
-			if len(line) == 0 {
-				line, err = pipeReader.ReadBytes('\n')
-			}
-
-			// Ignore EOF, processes will write data to the pipe many times.
+			line, err := reader.ReadBytes('\n')
 			if err != nil && err != io.EOF {
-				panic(err)
+				log.Println(err)
+				time.Sleep(100 * time.Millisecond)
+				continue
 			}
 
-			// If there is no data left, flush the buffer.
+			// If there is no data left, finish reading.
 			if len(line) == 0 {
 				break
 			}
 
-			// We definitely cannot send a line over 50kB - it won't fit in a single record.
-			// With metrics, it's fairly unlikely to have a line that long, so we truncate here just to be sure.
-			if len(line) > recordCap {
-				line = line[0 : recordCap-1]
+			// Truncate lines longer than lineCap size.
+			if len(line) > lineCap {
+				line = line[0:lineCap]
+				line[lineCap-1] = '\n'
 			}
 
-			// Check for overflow. The "line" buffer gets passed to the next iteration.
-			if len(line)+record.Len() > recordCap {
-				break
+			// If we have overflown the channel, drop data on the floor.
+			if len(pipeline) < cap(pipeline) {
+				pipeline <- line
 			}
-
-			// Flush the line and clear the temporary line buffer.
-			record.Write(line)
-			line = nil
 
 		}
 
-		// Send the record.
-		if record.Len() > 0 {
-			log.Printf("Sending %d bytes\n", record.Len())
-			record.Reset()
-		}
-
-		// Wait for more data.
-		time.Sleep(5 * time.Second)
+		conn.Close()
 	}
 }
