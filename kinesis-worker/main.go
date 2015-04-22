@@ -172,7 +172,8 @@ func receiver() {
 		StreamName: aws.String(awsStreamName),
 	})
 	if err != nil {
-		log.Fatal("Receiver failed to describe the stream: %s\n", err)
+		log.Printf("Receiver failed to describe the stream: %s\n", err)
+		return
 	}
 	client = nil
 
