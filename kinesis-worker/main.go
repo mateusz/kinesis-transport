@@ -130,6 +130,7 @@ func shardReceiver(quit chan bool, shardId *string) {
 				switch err.Code {
 				case "ExpiredIteratorException":
 					// Force iterator refresh.
+					log.Println("Forcing iterator refresh.")
 					shardIterator = nil
 					continue
 				}
