@@ -12,6 +12,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
 	"time"
 )
 
@@ -32,6 +33,7 @@ var (
 	awsRegion     = ""
 	awsStreamName = ""
 	credDuration  = 3600
+	tee           = false
 )
 
 // Computed inputs.
@@ -47,7 +49,7 @@ var (
 
 func init() {
 	// Parse input parameters.
-	flag.StringVar(&awsArn, "arn", "", "REQUIRED: ARN of the role to assume")
+	flag.StringVar(&awsArn, "arn", "", "ARN of the role to assume")
 	flag.StringVar(&awsRegion, "region", "", "REQUIRED: Region")
 	flag.StringVar(&awsStreamName, "stream-name", "", "REQUIRED: Kinesis stream name")
 	flag.IntVar(&pipelineCap, "pipeline-cap", pipelineCap, "Amount of metric lines we can hold in the buffer at any given time. Overflow will be immediately be dropped.")
@@ -58,7 +60,9 @@ func init() {
 	flag.StringVar(&connHost, "host", connHost, "Hostname")
 	flag.IntVar(&connPort, "port", connPort, "Port")
 	flag.StringVar(&connType, "protocol", connType, "Protocol (tcp or udp)")
+	flag.IntVar(&maxRetries, "max-retries", maxRetries, "Amount of times to retry if AWS API calls fail.")
 	flag.IntVar(&credDuration, "cred-duration", credDuration, "Temporary credentials duration. Min 900, max 3600 seconds.")
+	flag.BoolVar(&tee, "tee", tee, "Print data being sent to Kinesis to stdout.")
 
 	flag.Parse()
 
@@ -67,9 +71,6 @@ func init() {
 	maxTickDuration = time.Duration(maxTick) * time.Millisecond
 
 	// Validate required inputs.
-	if awsArn == "" {
-		log.Fatal("Provide ARN of the role to assume via --arn flag")
-	}
 	if awsRegion == "" {
 		log.Fatal("Provide region via --region flag")
 	}
@@ -78,17 +79,24 @@ func init() {
 	}
 
 	// Create AWS structures.
-	tempCredentials := &awstempcreds.TempCredentialsProvider{
-		Region:   awsRegion,
-		Duration: time.Duration(credDuration) * time.Second,
-		RoleARN:  awsArn,
-	}
+	if awsArn != "" {
+		tempCredentials := &awstempcreds.TempCredentialsProvider{
+			Region:   awsRegion,
+			Duration: time.Duration(credDuration) * time.Second,
+			RoleARN:  awsArn,
+		}
 
-	kinesisClient = kinesis.New(&aws.Config{
-		Region:      awsRegion,
-		Credentials: tempCredentials,
-		MaxRetries:  maxRetries,
-	})
+		kinesisClient = kinesis.New(&aws.Config{
+			Region:      awsRegion,
+			Credentials: tempCredentials,
+			MaxRetries:  maxRetries,
+		})
+	} else {
+		kinesisClient = kinesis.New(&aws.Config{
+			Region:     awsRegion,
+			MaxRetries: maxRetries,
+		})
+	}
 }
 
 func main() {
@@ -99,6 +107,10 @@ func main() {
 
 // Sends the record to Kinesis. This could take any amount of time due to the internal retries.
 func sendAndReset(record *bytes.Buffer) {
+	if tee {
+		fmt.Fprint(os.Stdout, record.String())
+	}
+
 	// Partition by hashing the data. This will be a bit random, but will at least ensure all shards are used
 	// (if we ever have more than one)
 	partitionKey := fmt.Sprintf("%x", md5.Sum(record.Bytes()))
