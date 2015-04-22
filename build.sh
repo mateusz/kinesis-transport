@@ -13,3 +13,5 @@ for dir in kinesis*; do
 		cd ..
 	fi
 done
+
+gzip ${BUILDDIR}/*

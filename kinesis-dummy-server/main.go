@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
 	"time"
 )
 
@@ -56,7 +57,7 @@ func listener() {
 				break
 			}
 
-			log.Printf("%s", line)
+			fmt.Fprintf(os.Stdout, "%s", line)
 
 		}
 
