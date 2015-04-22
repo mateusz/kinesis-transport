@@ -9,9 +9,16 @@ for dir in kinesis*; do
 	if [ -d $dir ]; then
 		echo "Building $dir"
 		cd $dir
-		$GOPATH/bin/gox -output="../$BUILDDIR/{{.Dir}}_${LATEST_TAG}_{{.OS}}_{{.Arch}}" -osarch "linux/amd64 darwin/amd64"
+		$GOPATH/bin/gox -output="../$BUILDDIR/{{.Dir}}_version_${LATEST_TAG}_{{.OS}}_{{.Arch}}" -osarch "linux/amd64 darwin/amd64"
 		cd ..
 	fi
 done
 
-gzip ${BUILDDIR}/*
+cd ${BUILDDIR}
+for file in *
+do
+	shortened_file=${file%_version_*}
+	mv $file $shortened_file
+	tar -zcvf "$file.tar.gz" "$shortened_file"
+	rm $shortened_file
+done
