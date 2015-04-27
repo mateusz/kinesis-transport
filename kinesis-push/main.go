@@ -130,7 +130,7 @@ func sendAndReset(record *bytes.Buffer) {
 		}
 
 		// Send has failed.
-		if i < maxRetries {
+		if i < maxRetries-1 {
 			log.Printf("Retrying in %d s, sender failed to put record on try %d: %s.\n", backoff/time.Second, i, err)
 			time.Sleep(backoff)
 		} else {
