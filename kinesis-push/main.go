@@ -23,8 +23,8 @@ var (
 	pipelineCap   = 1000
 	lineCap       = 10 * 1024
 	recordCap     = 50 * 1024
-	maxTick       = 1000
-	minTick       = 1000
+	maxTick       = 10000
+	minTick       = 10000
 	connHost      = "localhost"
 	connPort      = 2003
 	connType      = "tcp"
@@ -60,7 +60,7 @@ func init() {
 	flag.StringVar(&connHost, "host", connHost, "Hostname")
 	flag.IntVar(&connPort, "port", connPort, "Port")
 	flag.StringVar(&connType, "protocol", connType, "Protocol (tcp or udp)")
-	flag.IntVar(&maxRetries, "max-retries", maxRetries, "Amount of times to retry if AWS API calls fail.")
+	flag.IntVar(&maxRetries, "max-retries", maxRetries, "Amount of times to retry if AWS API calls fail - used twice: both internally within the AWS calls and externally.")
 	flag.IntVar(&credDuration, "cred-duration", credDuration, "Temporary credentials duration. Min 900, max 3600 seconds.")
 	flag.BoolVar(&tee, "tee", tee, "Print data being sent to Kinesis to stdout.")
 
@@ -114,15 +114,28 @@ func sendAndReset(record *bytes.Buffer) {
 	// Partition by hashing the data. This will be a bit random, but will at least ensure all shards are used
 	// (if we ever have more than one)
 	partitionKey := fmt.Sprintf("%x", md5.Sum(record.Bytes()))
-	_, err := kinesisClient.PutRecord(&kinesis.PutRecordInput{
-		Data:         record.Bytes(),
-		PartitionKey: aws.String(partitionKey),
-		StreamName:   aws.String(awsStreamName),
-	})
 
-	if err != nil {
-		// Send has failed - drop the record and proceed.
-		log.Printf("Sender failed to put record: %s\n", err)
+	// Try a few times on error. The initial reason for this is Go AWS SDK seems to have some weird timing issue,
+	// where sometimes the request would just EOF if requests are made in regular intervals. For example doing
+	// "put-record" from us-west-1 to ap-southeast-2 every 6-7 seconds will cause EOF error, without the record being sent.
+	for i, backoff := 0, time.Second; i < maxRetries; i, backoff = i+1, backoff*2 {
+		_, err := kinesisClient.PutRecord(&kinesis.PutRecordInput{
+			Data:         record.Bytes(),
+			PartitionKey: aws.String(partitionKey),
+			StreamName:   aws.String(awsStreamName),
+		})
+
+		if err == nil {
+			break
+		}
+
+		// Send has failed.
+		if i < maxRetries {
+			log.Printf("Retrying in %d s, sender failed to put record on try %d: %s.\n", backoff/time.Second, i, err)
+			time.Sleep(backoff)
+		} else {
+			log.Printf("Aborting, sender failed to put record on try %d: %s.\n", i, err)
+		}
 	}
 
 	record.Reset()
