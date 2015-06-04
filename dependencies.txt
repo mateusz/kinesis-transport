@@ -1,0 +1,1 @@
+github.com/awslabs/aws-sdk-go 528fdccfb1784861a4a24809328f891336449926
